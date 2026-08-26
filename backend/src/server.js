@@ -1,0 +1,39 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const client = require('prom-client');
+const { pool, migrate } = require('./db');
+
+const app = express(); const port = process.env.PORT || 3000; const secret = process.env.JWT_SECRET || 'development-only-secret';
+client.collectDefaultMetrics();
+const httpDuration = new client.Histogram({ name:'http_request_duration_seconds', help:'HTTP request duration', labelNames:['method','route','status'] });
+app.use(cors({ origin: process.env.CORS_ORIGIN?.split(',') || '*' })); app.use(express.json());
+app.use((req,res,next) => { const stop=httpDuration.startTimer(); res.on('finish',()=>stop({method:req.method,route:req.route?.path || req.path,status:res.statusCode})); next(); });
+
+const auth = (req,res,next) => { const token=req.headers.authorization?.replace('Bearer ',''); try { req.user=jwt.verify(token,secret); next(); } catch { res.status(401).json({error:'Não autenticado'}); } };
+const monthStart = (value) => /^\d{4}-\d{2}$/.test(value || '') ? `${value}-01` : new Date().toISOString().slice(0,7)+'-01';
+
+app.get('/healthz', (_,res)=>res.status(200).json({status:'ok'}));
+app.get('/ready', async (_,res)=> { try { await pool.query('SELECT 1'); res.json({status:'ready'}); } catch { res.status(503).json({status:'unavailable'}); } });
+app.get('/metrics', async (_,res)=> { res.set('Content-Type',client.register.contentType); res.end(await client.register.metrics()); });
+app.post('/api/auth/login', async (req,res) => { const {email,password}=req.body; const result=await pool.query('SELECT * FROM users WHERE email=$1',[email]); const user=result.rows[0]; if (!user || !await bcrypt.compare(password||'',user.password_hash)) return res.status(401).json({error:'E-mail ou senha inválidos'}); const token=jwt.sign({id:user.id,email:user.email,name:user.name},secret,{expiresIn:'8h'}); res.json({token,user:{id:user.id,email:user.email,name:user.name}}); });
+app.get('/api/auth/me',auth,(req,res)=>res.json({user:req.user}));
+
+app.get('/api/categories',auth,async(req,res)=>res.json((await pool.query('SELECT * FROM categories WHERE user_id=$1 ORDER BY name',[req.user.id])).rows));
+app.post('/api/categories',auth,async(req,res)=> { const {name,color='#6366f1',icon='Tag',type='both'}=req.body; if(!name) return res.status(400).json({error:'Nome obrigatório'}); const r=await pool.query('INSERT INTO categories(user_id,name,color,icon,type) VALUES($1,$2,$3,$4,$5) RETURNING *',[req.user.id,name,color,icon,type]); res.status(201).json(r.rows[0]); });
+app.put('/api/categories/:id',auth,async(req,res)=> { const {name,color,icon,type}=req.body; const r=await pool.query('UPDATE categories SET name=$1,color=$2,icon=$3,type=$4 WHERE id=$5 AND user_id=$6 RETURNING *',[name,color,icon,type,req.params.id,req.user.id]); if(!r.rowCount)return res.sendStatus(404);res.json(r.rows[0]); });
+app.delete('/api/categories/:id',auth,async(req,res)=> { const r=await pool.query('DELETE FROM categories WHERE id=$1 AND user_id=$2',[req.params.id,req.user.id]);res.sendStatus(r.rowCount?204:404); });
+
+app.get('/api/transactions',auth,async(req,res)=> { const page=Math.max(+req.query.page||1,1), limit=Math.min(Math.max(+req.query.limit||10,1),100), offset=(page-1)*limit; const filters=['t.user_id=$1'], params=[req.user.id]; if(req.query.type){params.push(req.query.type);filters.push(`t.type=$${params.length}`)} if(req.query.from){params.push(req.query.from);filters.push(`t.date >= $${params.length}`)} if(req.query.to){params.push(req.query.to);filters.push(`t.date <= $${params.length}`)} if(req.query.search){params.push(`%${req.query.search}%`);filters.push(`t.description ILIKE $${params.length}`)} const where=filters.join(' AND '); const count=await pool.query(`SELECT count(*) FROM transactions t WHERE ${where}`,params); params.push(limit,offset); const items=await pool.query(`SELECT t.*,c.name category_name,c.color category_color FROM transactions t LEFT JOIN categories c ON c.id=t.category_id WHERE ${where} ORDER BY t.date DESC,t.id DESC LIMIT $${params.length-1} OFFSET $${params.length}`,params);res.json({items:items.rows,page,limit,total:+count.rows[0].count}); });
+app.post('/api/transactions',auth,async(req,res)=> { const {amount,date,type,description,status='paid',category_id}=req.body; if(!amount||!date||!['income','expense'].includes(type)||!description)return res.status(400).json({error:'Valor, data, tipo e descrição são obrigatórios'}); const r=await pool.query('INSERT INTO transactions(user_id,category_id,amount,date,type,description,status) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *',[req.user.id,category_id||null,amount,date,type,description,status]);res.status(201).json(r.rows[0]); });
+app.put('/api/transactions/:id',auth,async(req,res)=> { const {amount,date,type,description,status,category_id}=req.body; const r=await pool.query('UPDATE transactions SET category_id=$1,amount=$2,date=$3,type=$4,description=$5,status=$6,updated_at=now() WHERE id=$7 AND user_id=$8 RETURNING *',[category_id||null,amount,date,type,description,status,req.params.id,req.user.id]);if(!r.rowCount)return res.sendStatus(404);res.json(r.rows[0]); });
+app.delete('/api/transactions/:id',auth,async(req,res)=> { const r=await pool.query('DELETE FROM transactions WHERE id=$1 AND user_id=$2',[req.params.id,req.user.id]);res.sendStatus(r.rowCount?204:404); });
+
+app.get('/api/budgets',auth,async(req,res)=> {const month=monthStart(req.query.month);const r=await pool.query(`SELECT b.*,c.name category_name,c.color category_color,COALESCE((SELECT SUM(t.amount) FROM transactions t WHERE t.category_id=b.category_id AND t.user_id=b.user_id AND t.type='expense' AND date_trunc('month',t.date)=date_trunc('month',$3::date)),0) spent FROM budgets b JOIN categories c ON c.id=b.category_id WHERE b.user_id=$1 AND b.month=$2`,[req.user.id,month,month]);res.json(r.rows)});
+app.post('/api/budgets',auth,async(req,res)=> {const {category_id,amount,month}=req.body;const r=await pool.query('INSERT INTO budgets(user_id,category_id,amount,month) VALUES($1,$2,$3,$4) ON CONFLICT(user_id,category_id,month) DO UPDATE SET amount=EXCLUDED.amount RETURNING *',[req.user.id,category_id,amount,monthStart(month)]);res.status(201).json(r.rows[0])});
+app.delete('/api/budgets/:id',auth,async(req,res)=> {const r=await pool.query('DELETE FROM budgets WHERE id=$1 AND user_id=$2',[req.params.id,req.user.id]);res.sendStatus(r.rowCount?204:404)});
+app.get('/api/dashboard',auth,async(req,res)=> {const month=monthStart(req.query.month);const summary=await pool.query(`SELECT COALESCE(SUM(CASE WHEN type='income' THEN amount ELSE -amount END),0) balance,COALESCE(SUM(CASE WHEN type='income' THEN amount ELSE 0 END),0) income,COALESCE(SUM(CASE WHEN type='expense' THEN amount ELSE 0 END),0) expense FROM transactions WHERE user_id=$1 AND date_trunc('month',date)=date_trunc('month',$2::date)`,[req.user.id,month]);const categories=await pool.query(`SELECT c.id,c.name,c.color,COALESCE(SUM(t.amount),0) amount FROM categories c LEFT JOIN transactions t ON t.category_id=c.id AND t.type='expense' AND date_trunc('month',t.date)=date_trunc('month',$2::date) WHERE c.user_id=$1 GROUP BY c.id ORDER BY amount DESC`,[req.user.id,month]);const trend=await pool.query(`SELECT to_char(date_trunc('month',date),'YYYY-MM') month,COALESCE(SUM(CASE WHEN type='income' THEN amount ELSE 0 END),0) income,COALESCE(SUM(CASE WHEN type='expense' THEN amount ELSE 0 END),0) expense FROM transactions WHERE user_id=$1 AND date >= ($2::date - interval '5 months') GROUP BY 1 ORDER BY 1`,[req.user.id,month]);res.json({month,summary:summary.rows[0],expensesByCategory:categories.rows,trend:trend.rows})});
+
+migrate().then(()=>app.listen(port,()=>console.log(`API listening on ${port}`))).catch(err=>{console.error('Migration failed',err);process.exit(1)});
