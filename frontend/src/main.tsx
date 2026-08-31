@@ -30,10 +30,19 @@ function TransactionModal({categories,onClose,onSave}:{categories:Category[];onC
  const [busy,setBusy]=useState(false),[error,setError]=useState('');
  const update=(key:string,value:string)=>setForm({...form,[key]:value});
  const submit=async(e:React.FormEvent)=>{e.preventDefault();setBusy(true);try{await onSave({...form,amount:+form.amount,category_id:+form.category_id||null});}catch(err:any){setError(err.message);setBusy(false);}};
- return <div className="overlay"><form className="modal" onSubmit={submit}>
+
+ useEffect(() => {
+   const handleKeyDown = (e: KeyboardEvent) => {
+     if (e.key === 'Escape') onClose();
+   };
+   window.addEventListener('keydown', handleKeyDown);
+   return () => window.removeEventListener('keydown', handleKeyDown);
+ }, [onClose]);
+
+ return <div className="overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}><form className="modal" onSubmit={submit}>
   <button aria-label="Fechar" title="Fechar modal" className="close" type="button" onClick={onClose}><X/></button><h2>Nova transação</h2><p>Registre uma receita ou despesa.</p>
-  <div className="type-toggle"><button type="button" className={form.type==='expense'?'selected expense':''} onClick={()=>update('type','expense')}>Despesa</button><button type="button" className={form.type==='income'?'selected income':''} onClick={()=>update('type','income')}>Receita</button></div>
-  <label>Descrição<input required value={form.description} onChange={e=>update('description',e.target.value)} placeholder="Ex.: Mercado semanal"/></label>
+  <div className="type-toggle"><button type="button" aria-pressed={form.type === 'expense'} className={form.type==='expense'?'selected expense':''} onClick={()=>update('type','expense')}>Despesa</button><button type="button" aria-pressed={form.type === 'income'} className={form.type==='income'?'selected income':''} onClick={()=>update('type','income')}>Receita</button></div>
+  <label>Descrição<input autoFocus required value={form.description} onChange={e=>update('description',e.target.value)} placeholder="Ex.: Mercado semanal"/></label>
   <div className="row"><label>Valor<input required min="0.01" step="0.01" type="number" value={form.amount} onChange={e=>update('amount',e.target.value)} placeholder="0,00"/></label><label>Data<input required type="date" value={form.date} onChange={e=>update('date',e.target.value)}/></label></div>
   <label>Categoria<select value={form.category_id} onChange={e=>update('category_id',e.target.value)}><option value="">Sem categoria</option>{categories.filter(c=>c.type==='both'||c.type===form.type).map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select></label>{error&&<small className="error">{error}</small>}<button className="primary wide" disabled={busy}>{busy?'Salvando...':'Salvar transação'}</button>
  </form></div>
